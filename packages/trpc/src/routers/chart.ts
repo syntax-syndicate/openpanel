@@ -4,9 +4,11 @@ import { z } from 'zod';
 
 import {
   TABLE_NAMES,
+  ch,
   chQuery,
   createSqlBuilder,
   db,
+  fn,
   getSelectPropertyKey,
   toDate,
 } from '@openpanel/db';
@@ -18,6 +20,7 @@ import {
 } from '@openpanel/validation';
 
 import { round } from '@openpanel/common';
+import { createQuery } from '@openpanel/db';
 import {
   differenceInDays,
   differenceInMonths,
@@ -49,9 +52,11 @@ export const chartRouter = createTRPCRouter({
       }),
     )
     .query(async ({ input: { projectId } }) => {
-      const events = await chQuery<{ name: string }>(
-        `SELECT DISTINCT name FROM ${TABLE_NAMES.event_names_mv} WHERE project_id = ${escape(projectId)}`,
-      );
+      const events = await createQuery(ch)
+        .select([fn.distinct('name')])
+        .from(TABLE_NAMES.event_names_mv)
+        .where('project_id', '=', projectId)
+        .execute<{ name: string }>();
 
       return [
         {
@@ -69,16 +74,21 @@ export const chartRouter = createTRPCRouter({
       }),
     )
     .query(async ({ input: { projectId, event } }) => {
-      const res = await chQuery<{ property_key: string; created_at: string }>(
-        `SELECT 
-          distinct property_key, 
-          max(created_at) as created_at 
-        FROM ${TABLE_NAMES.event_property_values_mv} 
-        WHERE project_id = ${escape(projectId)}
-        ${event && event !== '*' ? `AND name = ${escape(event)}` : ''}
-        GROUP BY property_key 
-        ORDER BY created_at DESC`,
-      );
+      const query = createQuery(ch)
+        .select([
+          fn.distinct('property_key'),
+          fn.max('created_at', 'created_at'),
+        ])
+        .from(TABLE_NAMES.event_property_values_mv)
+        .where('project_id', '=', projectId)
+        .when(!!event && event !== '*', (q) => q.andWhere('name', '=', event))
+        .groupBy(['property_key'])
+        .orderBy('created_at', 'DESC');
+
+      const res = await query.execute<{
+        property_key: string;
+        created_at: string;
+      }>();
 
       const properties = res
         .map((item) => item.property_key)
@@ -136,33 +146,30 @@ export const chartRouter = createTRPCRouter({
       if (property.startsWith('properties.')) {
         const propertyKey = property.replace(/^properties\./, '');
 
-        const res = await chQuery<{
-          property_value: string;
-          created_at: string;
-        }>(
-          `SELECT 
-            distinct property_value, 
-            max(created_at) as created_at 
-          FROM ${TABLE_NAMES.event_property_values_mv}
-          WHERE project_id = ${escape(projectId)}
-          AND property_key = ${escape(propertyKey)}
-          ${event && event !== '*' ? `AND name = ${escape(event)}` : ''}
-          GROUP BY property_value 
-          ORDER BY created_at DESC`,
-        );
+        const res = await createQuery(ch)
+          .select(['distinct property_value', 'max(created_at) as created_at'])
+          .from(TABLE_NAMES.event_property_values_mv)
+          .where('project_id', '=', projectId)
+          .andWhere('property_key', '=', propertyKey)
+          .when(!!event && event !== '*', (q) => q.andWhere('name', '=', event))
+          .groupBy(['property_value'])
+          .orderBy('created_at', 'DESC')
+          .execute<{
+            property_value: string;
+            created_at: string;
+          }>();
 
         values.push(...res.map((e) => e.property_value));
       } else {
-        const { sb, getSql } = createSqlBuilder();
-        sb.where.project_id = `project_id = ${escape(projectId)}`;
-        if (event !== '*') {
-          sb.where.event = `name = ${escape(event)}`;
-        }
-        sb.select.values = `distinct ${getSelectPropertyKey(property)} as values`;
-        sb.where.date = `${toDate('created_at', 'month')} > now() - INTERVAL 6 MONTH`;
-        sb.orderBy.created_at = 'created_at DESC';
-        sb.limit = 100_000;
-        const events = await chQuery<{ values: string[] }>(getSql());
+        const events = await createQuery(ch)
+          .select([`distinct ${getSelectPropertyKey(property)} as values`])
+          .from(TABLE_NAMES.events)
+          .where('project_id', '=', projectId)
+          .when(event !== '*', (q) => q.andWhere('name', '=', event))
+          .andWhere(fn.dateDiff('month', 'created_at', fn.now()), '<', 6)
+          .orderBy('created_at', 'DESC')
+          .limit(100_000)
+          .execute<{ values: string[] }>();
 
         values.push(
           ...pipe(
